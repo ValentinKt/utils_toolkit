@@ -1,25 +1,64 @@
-#!/bin/zsh
+#!/bin/bash
+set -euo pipefail
 
-# Default values
+# Define color variables.
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+#############################
+# Default Values
+#############################
 DELIMITER=","
-LINES=10
-OUTPUT_FILE="csv_preview.md"
-USE_CSVKIT=false
+LINES=20
+OUTPUT_FILE="csv_preview.html"
+USE_CSVKIT=true
 PATTERN="*.csv"
-OUTPUT_FORMAT="md"  # md, html, or pdf
-INCLUDE_TOC=false
+OUTPUT_FORMAT="html"   # Options: md, html, or pdf
+INCLUDE_TOC=true
 PANDOC_CSS=""
 PANDOC_TEMPLATE=""
 COLUMNS=""
 INTERACTIVE=false
-PARALLEL=false # Requires GNU parallel (brew install parallel) for parallel processing of CSV files. It no longer seems necessary to parallelize with today's computers. ;)
+PARALLEL=false    # Requires GNU parallel for parallel processing
 METADATA_FIELDS="size,modified"
 COMPRESS_OUTPUT=false
 ERROR_LOG=""
+SHOW_METADATA=false    # Enabled by default; disable with -M
+SHOW_HEADERS=false     # Enabled by default; disable with -H
+SHOW_LINES=true
 
-# Function to display usage
+#############################
+# OS Detection for sed In‑place & CPU Count
+#############################
+# Set the sed in‑place option depending on the platform.
+if sed --version &>/dev/null; then
+    # GNU sed (Linux)
+    SED_INPLACE=(-i)
+else
+    # BSD sed (macOS)
+    SED_INPLACE=(-i '')
+fi
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    CPU_COUNT=$(sysctl -n hw.ncpu)
+else
+    CPU_COUNT=$(nproc)
+fi
+
+#############################
+# Enable nullglob for bash (so that unmatched globs produce an empty array)
+#############################
+shopt -s nullglob
+
+#############################
+# Usage Function
+#############################
 usage() {
-    echo "Usage: $0 [-d delimiter] [-l lines] [-o output_file] [-c] [-p pattern] [-f format] [-t] [-s css_file] [-m template] [-k columns] [-i] [-P] [-e metadata_fields] [-z] [-L error_log]"
+    echo -e "${CYAN}Usage:${NC} $0 [-d delimiter] [-l lines] [-o output_file] [-c] [-p pattern] [-f format] [-t] [-s css_file] [-m template] [-k columns] [-i] [-P] [-e metadata_fields] [-z] [-L error_log] [-M] [-H] [-N]"
     echo "  -d: Specify the delimiter (default: ',')"
     echo "  -l: Number of lines to display (default: 10)"
     echo "  -o: Output file (default: csv_preview.md)"
@@ -30,16 +69,21 @@ usage() {
     echo "  -s: CSS file for HTML output (requires -f html)"
     echo "  -m: LaTeX template for PDF output (requires -f pdf)"
     echo "  -k: Comma-separated list of column names to preview (requires -c)"
-    echo "  -i: Interactive mode for file selection (requires fzf)" # Use fzf to select files interactively
-    echo "  -P: Enable parallel processing of CSV files" # Not necessary with today's computers
-    echo "  -e: Comma-separated list of metadata fields to display (default: size,modified)" # values : size, modified, permissions, owner
-    echo "  -z: Compress output file (e.g., .md.gz, .html.gz, .pdf.gz)" # Compress the output file
-    echo "  -L: Log errors to a file instead of stderr" # Allowing to log errors to a file
+    echo "  -i: Interactive mode for file selection (requires fzf)"
+    echo "  -P: Enable parallel processing of CSV files"
+    echo "  -e: Comma-separated list of metadata fields to display (default: size,modified)"
+    echo "  -z: Compress output file (e.g., .md.gz, .html.gz, .pdf.gz)"
+    echo "  -L: Log errors to a file instead of stderr"
+    echo "  -M: Disable display of file metadata"
+    echo "  -H: Disable display of CSV headers"
+    echo "  -N: Disable display of CSV lines"
     exit 1
 }
 
-# Parse command-line options
-while getopts "d:l:o:cp:f:ts:m:k:iPe:zL:" opt; do
+#############################
+# Parse Command-Line Options
+#############################
+while getopts "d:l:o:cp:f:ts:m:k:iPe:zL:MHN" opt; do
     case $opt in
         d) DELIMITER="$OPTARG" ;;
         l) LINES="$OPTARG" ;;
@@ -56,105 +100,166 @@ while getopts "d:l:o:cp:f:ts:m:k:iPe:zL:" opt; do
         e) METADATA_FIELDS="$OPTARG" ;;
         z) COMPRESS_OUTPUT=true ;;
         L) ERROR_LOG="$OPTARG" ;;
-        ?) usage ;;
+        M) SHOW_METADATA=false ;;
+        H) SHOW_HEADERS=false ;;
+        N) SHOW_LINES=false ;;
+        *) usage ;;
     esac
 done
 
-# Redirect stderr to error log if specified
+# Redirect stderr to error log if specified.
 if [[ -n "$ERROR_LOG" ]]; then
     exec 2>> "$ERROR_LOG"
 fi
 
-# Validate output format
+#############################
+# Validate Output Format & Dependencies
+#############################
 case "$OUTPUT_FORMAT" in
     md|html|pdf) ;;
-    *) echo "Error: Invalid output format '$OUTPUT_FORMAT'. Use 'md', 'html', or 'pdf'." >&2; exit 1 ;;
+    *) echo -e "${RED}Error:${NC} Invalid output format '$OUTPUT_FORMAT'. Use 'md', 'html', or 'pdf'." >&2; exit 1 ;;
 esac
 
-# Check if csvkit is installed only when -c or -k is explicitly used
-if [[ "$USE_CSVKIT" == true && -n "$COLUMNS" ]]; then
-    if ! command -v csvlook &> /dev/null; then
-        echo "Error: csvkit is not installed. Install it with 'brew install csvkit' or run without -c or -k." >&2
+if [[ "$USE_CSVKIT" == true || -n "$COLUMNS" ]]; then
+    if ! command -v csvlook -I &>/dev/null; then
+        echo -e "${RED}Error:${NC} csvkit is not installed. Install it or run without -c or -k." >&2
         exit 1
     fi
 fi
 
-# Check if pandoc is installed when html or pdf output is requested
 if [[ "$OUTPUT_FORMAT" != "md" ]]; then
-    if ! command -v pandoc &> /dev/null; then
-        echo "Error: pandoc is not installed. Install it with 'brew install pandoc' or use -f md." >&2
+    if ! command -v pandoc &>/dev/null; then
+        echo -e "${RED}Error:${NC} pandoc is not installed. Install it or use -f md." >&2
         exit 1
     fi
 fi
 
-# Check if fzf is installed when -i is used
 if [[ "$INTERACTIVE" == true ]]; then
-    if ! command -v fzf &> /dev/null; then
-        echo "Error: fzf is not installed. Install it with 'brew install fzf' or run without -i." >&2
+    if ! command -v fzf &>/dev/null; then
+        echo -e "${RED}Error:${NC} fzf is not installed. Install it or run without -i." >&2
         exit 1
     fi
 fi
 
-# Check if parallel is installed when -P is used
 if [[ "$PARALLEL" == true ]]; then
-    if ! command -v parallel &> /dev/null; then
-        echo "Error: parallel is not installed. Install it with 'brew install parallel' or run without -P." >&2
+    if ! command -v parallel &>/dev/null; then
+        echo -e "${RED}Error:${NC} parallel is not installed. Install it or run without -P." >&2
         exit 1
     fi
 fi
 
-# Validate CSS file if provided, or use default
+#############################
+# Validate CSS & LaTeX Template
+#############################
+echo -e "${BLUE}Validating CSS and LaTeX template files...${NC}" >&2
+if [[ -z "$PANDOC_CSS" ]]; then
+    echo "empty";
+else
+    echo "not empty";
+fi
+echo "PANDOC_CSS: $PANDOC_CSS"
 if [[ -z "$PANDOC_CSS" && "$OUTPUT_FORMAT" == "html" ]]; then
     PANDOC_CSS="style.css"
     if [[ ! -f "$PANDOC_CSS" ]]; then
-        echo "Warning: Default CSS file 'style.css' not found. Creating a default one." >&2
+        echo -e "${YELLOW}Warning:${NC} Default CSS file 'style.css' not found. Creating a default one." >&2
         cat > "$PANDOC_CSS" << 'EOF'
-body {
-    font-family: Arial, sans-serif;
-    line-height: 1.6;
-    margin: 0 auto;
-    max-width: 800px;
-    padding: 20px;
-}
-h1, h2, h3 {
-    color: #333;
-}
-table {
-    border-collapse: collapse;
-    width: 100%;
-    margin-bottom: 20px;
-}
-th, td {
-    border: 1px solid #ddd;
-    padding: 8px;
-    text-align: left;
-}
-th {
-    background-color: #f2f2f2;
-}
-pre {
-    background-color: #f8f8f8;
-    padding: 10px;
-    border-radius: 5px;
-    overflow-x: auto;
-}
-code {
-    font-family: Consolas, Monaco, 'Andale Mono', monospace;
-}
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            line-height: 1.6;
+            margin: 40px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        h1 { font-size: 2.5em; }
+        h2 { font-size: 2em; }
+        h3 { font-size: 1.75em; }
+        h4 { font-size: 1.5em; }
+        h5 { font-size: 1.25em; }
+        h6 { font-size: 1em; }
+        p {
+            font-size: 1em;
+            margin-bottom: 20px;
+        }
+        ul, ol {
+            padding-left: 40px;
+            margin-bottom: 20px;
+        }
+        li {
+            margin-bottom: 8px;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        blockquote {
+            border-left: 4px solid #e74c3c;
+            margin-left: 0;
+            padding: 15px 20px;
+            color: #7f8c8d;
+            font-style: italic;
+        }
+        code {
+            background-color: #f3f3f3;
+            border-radius: 3px;
+            padding: 2px 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        pre {
+            background-color: #f3f3f3;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+        strong {
+            font-weight: bold;
+        }
+        em {
+            font-style: italic;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
 EOF
     fi
 elif [[ -n "$PANDOC_CSS" && "$OUTPUT_FORMAT" != "html" ]]; then
-    echo "Warning: CSS file specified but output format is not HTML. Ignoring -s." >&2
+    echo -e "${YELLOW}Warning:${NC} CSS file specified but output format is not HTML. Ignoring -s." >&2
 elif [[ -n "$PANDOC_CSS" && ! -f "$PANDOC_CSS" ]]; then
-    echo "Error: CSS file '$PANDOC_CSS' does not exist." >&2
+    echo -e "${RED}Error:${NC} CSS file '$PANDOC_CSS' does not exist." >&2
     exit 1
 fi
 
-# Validate LaTeX template if provided, or use default
 if [[ -z "$PANDOC_TEMPLATE" && "$OUTPUT_FORMAT" == "pdf" ]]; then
     PANDOC_TEMPLATE="custom_template.tex"
     if [[ ! -f "$PANDOC_TEMPLATE" ]]; then
-        echo "Warning: Default LaTeX template 'custom_template.tex' not found. Creating a default one." >&2
+        echo -e "${YELLOW}Warning:${NC} Default LaTeX template 'custom_template.tex' not found. Creating a default one." >&2
         cat > "$PANDOC_TEMPLATE" << 'EOF'
 \documentclass[a4paper,12pt]{article}
 \usepackage[utf8]{inputenc}
@@ -181,125 +286,118 @@ $body$
 EOF
     fi
 elif [[ -n "$PANDOC_TEMPLATE" && "$OUTPUT_FORMAT" != "pdf" ]]; then
-    echo "Warning: LaTeX template specified but output format is not PDF. Ignoring -m." >&2
+    echo -e "${YELLOW}Warning:${NC} LaTeX template specified but output format is not PDF. Ignoring -m." >&2
 elif [[ -n "$PANDOC_TEMPLATE" && ! -f "$PANDOC_TEMPLATE" ]]; then
-    echo "Error: LaTeX template '$PANDOC_TEMPLATE' does not exist." >&2
+    echo -e "${RED}Error:${NC} LaTeX template '$PANDOC_TEMPLATE' does not exist." >&2
     exit 1
 fi
 
-# Function to check if a file is empty or unreadable
+#############################
+# Utility Functions
+#############################
+
+# check_file: verifies that the file exists, is readable, and is not empty.
 check_file() {
     local file="$1"
     if [[ ! -f "$file" ]]; then
-        echo "Error: File '$file' does not exist or is not a regular file." >&2
+        echo -e "${RED}Error:${NC} File '$file' does not exist or is not a regular file." >&2
         return 1
     elif [[ ! -r "$file" ]]; then
-        echo "Error: File '$file' is not readable." >&2
+        echo -e "${RED}Error:${NC} File '$file' is not readable." >&2
         return 1
     elif [[ ! -s "$file" ]]; then
-        echo "Warning: File '$file' is empty." >&2
+        echo -e "${YELLOW}Warning:${NC} File '$file' is empty." >&2
         return 1
     fi
     return 0
 }
 
-# Function to decompress .gz files
+# decompress_file: if the file is a .gz, decompress it to a temporary file.
 decompress_file() {
     local file="$1"
     local temp_file="$2"
     if [[ "$file" == *.gz ]]; then
-        gunzip -c "$file" > "$temp_file" || {
-            echo "Error: Failed to decompress '$file'." >&2
+        if ! gunzip -c "$file" > "$temp_file"; then
+            echo -e "${RED}Error:${NC} Failed to decompress '$file'." >&2
             return 1
-        }
+        fi
         echo "$temp_file"
     else
         echo "$file"
     fi
 }
 
-# Function to display file metadata
+# display_metadata: outputs file metadata based on METADATA_FIELDS.
 display_metadata() {
     local file="$1"
-    # echo "### File Metadata:"
+    echo "### File Metadata:"
     echo '```'
-    for field in ${(s:,:)METADATA_FIELDS}; do
+    OLDIFS=${IFS:-$' \t\n'}
+    IFS=','
+    for field in $METADATA_FIELDS; do
         case "$field" in
             size) echo "Size: $(stat -f %z "$file") bytes" ;;
             modified) echo "Last Modified: $(stat -f '%Sm' "$file")" ;;
             permissions) echo "Permissions: $(stat -f '%Sp' "$file")" ;;
             owner) echo "Owner: $(stat -f '%Su' "$file")" ;;
-            *) echo "Warning: Unknown metadata field '$field'. Supported fields: size, modified, permissions, owner." >&2 ;;
+            *) echo "Warning: Unknown metadata field '$field'. Supported: size, modified, permissions, owner." >&2 ;;
         esac
     done
+    IFS="$OLDIFS"
     echo '```'
 }
 
-# Function to display headers
+# display_headers: outputs CSV headers.
+# Optimization: only read the first line (using head) instead of scanning the whole file.
 display_headers() {
     local file="$1"
-    if [[ "$USE_CSVKIT" == true ]]; then
-        # echo "### Headers (via csvkit):"
-        echo '```'
+    echo "### Headers:"
+    echo '```'
+    if $USE_CSVKIT; then
         if [[ -n "$COLUMNS" ]]; then
-            csvcut -d "$DELIMITER" -c "$COLUMNS" "$file" 2>/dev/null | csvcut -n 2>/dev/null || {
-                echo "Error: Could not parse headers with csvkit for specified columns. Falling back to all headers." >&2
-                csvcut -d "$DELIMITER" -n "$file" 2>/dev/null || {
-                    echo "Error: Could not parse headers with csvkit. Falling back to raw output." >&2
-                    head -n 1 "$file"
-                }
-            }
+            head -n 1 "$file" | csvcut -d "$DELIMITER" -c "$COLUMNS" 2>/dev/null | csvcut -n
         else
-            csvcut -d "$DELIMITER" -n "$file" 2>/dev/null || {
-                echo "Error: Could not parse headers with csvkit. Falling back to raw output." >&2
-                head -n 1 "$file"
-            }
+            head -n 1 "$file" | csvcut -d "$DELIMITER" -n 2>/dev/null || head -n 1 "$file"
         fi
-        echo '```'
     else
-        # echo "### Headers:"
-        echo '```'
         head -n 1 "$file"
-        echo '```'
     fi
+    echo '```'
 }
 
-# Function to display lines
+# display_lines: outputs the first N lines of the CSV.
+# Optimization: use head to limit reading to just the header and the preview lines.
 display_lines() {
     local file="$1"
     local lines="$2"
-    if [[ "$USE_CSVKIT" == true ]]; then
-        # echo "### First $lines Lines (via csvkit):"
-        echo '```'
+    echo "### First $lines Lines:"
+    echo '```'
+    if $USE_CSVKIT; then
         if [[ -n "$COLUMNS" ]]; then
-            csvcut -d "$DELIMITER" -c "$COLUMNS" "$file" 2>/dev/null | csvlook 2>/dev/null | head -n $((lines + 2)) || {
-                echo "Error: Could not parse file with csvkit for specified columns. Falling back to all columns." >&2
-                csvlook -d "$DELIMITER" "$file" 2>/dev/null | head -n $((lines + 2)) || {
-                    echo "Error: Could not parse file with csvkit. Falling back to raw output." >&2
+            if ! head -n $((lines+1)) "$file" | csvcut -d "$DELIMITER" -c "$COLUMNS" 2>/dev/null | csvlook -I 2>/dev/null | head -n $((lines+2)); then
+                echo -e "${RED}Error:${NC} Could not parse file with csvkit for columns. Falling back." >&2
+                if ! head -n $((lines+1)) "$file" | csvlook -I 2>/dev/null | head -n $((lines+2)); then
                     head -n "$lines" "$file"
-                }
-            }
+                fi
+            fi
         else
-            csvlook -d "$DELIMITER" "$file" 2>/dev/null | head -n $((lines + 2)) || {
-                echo "Error: Could not parse file with csvkit. Falling back to raw output." >&2
+            if ! head -n $((lines+1)) "$file" | csvlook -I -d "$DELIMITER" 2>/dev/null | head -n $((lines+2)); then
+                echo -e "${RED}Error:${NC} Could not parse file with csvkit. Falling back." >&2
                 head -n "$lines" "$file"
-            }
+            fi
         fi
-        echo '```'
     else
-        # echo "### First $lines Lines:"
-        echo '```'
         head -n "$lines" "$file"
-        echo '```'
+        echo "...."
     fi
+    echo '```'
 }
 
-# Function to handle multi-character delimiters
+# handle_delimiter: if DELIMITER is more than one character, replace it with a single comma.
 handle_delimiter() {
     local file="$1"
     local temp_file="$2"
     if [[ ${#DELIMITER} -gt 1 ]]; then
-        # Use awk to replace multi-character delimiter with a single character (e.g., comma)
         awk -F"$DELIMITER" '{$1=$1}1' OFS="," "$file" > "$temp_file"
         echo "$temp_file"
     else
@@ -307,12 +405,13 @@ handle_delimiter() {
     fi
 }
 
-# Function to process a single file (for parallel processing)
+# process_file: process a single CSV file and output Markdown.
 process_file() {
     local file="$1"
-    local temp_decomp_file=$(mktemp)
-    local temp_file=$(mktemp)
-    trap 'rm -f $temp_decomp_file $temp_file' EXIT
+    local temp_decomp_file temp_file
+    temp_decomp_file=$(mktemp)
+    temp_file=$(mktemp)
+    trap 'rm -f "$temp_decomp_file" "$temp_file"' RETURN
 
     if ! check_file "$file"; then
         echo "## File: $file (Skipped due to errors)"
@@ -320,156 +419,165 @@ process_file() {
         return
     fi
 
+    local decompressed_file processed_file
     decompressed_file=$(decompress_file "$file" "$temp_decomp_file")
     processed_file=$(handle_delimiter "$decompressed_file" "$temp_file")
 
-    if [[ "$INCLUDE_TOC" == true ]]; then
-        echo "## File: $file {#file-${file//[^a-zA-Z0-9]/-}}"
+    if $INCLUDE_TOC; then
+        local anchor
+        anchor=$(echo "$file" | sed 's/[^a-zA-Z0-9]/-/g')
+        echo "## File: $file {#file-$anchor}"
     else
         echo "## File: $file"
     fi
     echo ""
 
-    display_metadata "$file"
-    echo ""
+    if $SHOW_METADATA; then
+        display_metadata "$file"
+        echo ""
+    fi
 
-    display_headers "$processed_file"
-    echo ""
+    if $SHOW_HEADERS; then
+        display_headers "$processed_file"
+        echo ""
+    fi
 
-    display_lines "$processed_file" "$LINES"
-    echo ""
+    if $SHOW_LINES; then
+        display_lines "$processed_file" "$LINES"
+        echo ""
+    fi
 }
 
-# Temporary files for decompression and delimiter handling
-TEMP_FILE=$(mktemp)
-TEMP_DECOMP_FILE=$(mktemp)
+#############################
+# Main Script Logic
+#############################
 
-# Trap to clean up temporary files on exit
-trap 'rm -f $TEMP_FILE $TEMP_DECOMP_FILE' EXIT
+echo -e "${GREEN}Starting CSV to Markdown conversion...${NC}"
 
-# Determine final output file based on format
+# Create a temporary Markdown file.
+TEMP_MD_FILE=$(mktemp)
+
+# Determine final output file based on OUTPUT_FORMAT.
 case "$OUTPUT_FORMAT" in
     md) FINAL_OUTPUT_FILE="$OUTPUT_FILE" ;;
-    html) FINAL_OUTPUT_FILE="${OUTPUT_FILE:r}.html" ;;
-    pdf) FINAL_OUTPUT_FILE="${OUTPUT_FILE:r}.pdf" ;;
+    html) FINAL_OUTPUT_FILE="${OUTPUT_FILE%.*}.html" ;;
+    pdf) FINAL_OUTPUT_FILE="${OUTPUT_FILE%.*}.pdf" ;;
 esac
 
-# Redirect output to a temporary Markdown file if converting to HTML or PDF
-if [[ "$OUTPUT_FORMAT" != "md" ]]; then
-    TEMP_MD_FILE=$(mktemp)
-    exec > "$TEMP_MD_FILE"
-else
-    exec > "$OUTPUT_FILE"
-fi
+echo -e "${BLUE}Output will be written to:${NC} ${CYAN}$FINAL_OUTPUT_FILE${NC}"
 
-# Print Markdown header
-# echo "# CSV Preview"
-# echo "Generated on: $(date)"
-# echo ""
+# Write initial Markdown header.
+{
+    if $INCLUDE_TOC; then
+        echo "## Table of Contents"
+        echo ""
+        echo "<!-- TOC will be inserted here -->"
+        echo ""
+    fi
+} >> "$TEMP_MD_FILE"
 
-# Include table of contents if requested
-if [[ "$INCLUDE_TOC" == true ]]; then
-    echo "## Table of Contents"
-    echo ""
-    echo "<!-- TOC will be inserted here -->"
-    echo ""
-fi
-
-# Count total CSV files for progress feedback
-if [[ "$INTERACTIVE" == true ]]; then
-    csv_files=($(ls ${~PATTERN}(N) | fzf -m --prompt="Select CSV files (use TAB to select multiple): "))
-    if [[ ${#csv_files[@]} -eq 0 ]]; then
-        echo "No files selected." >&2
+# File selection.
+if $INTERACTIVE; then
+    csv_files=( $(ls $PATTERN 2>/dev/null | fzf -m --prompt="Select CSV files (use TAB for multiple): ") )
+    if [ ${#csv_files[@]} -eq 0 ]; then
+        echo -e "${RED}No files selected.${NC}" >&2
         exit 1
     fi
 else
-    csv_files=(${~PATTERN}(N))
+    csv_files=( $PATTERN )
 fi
 
 total_files=${#csv_files[@]}
-if [[ $total_files -eq 0 ]]; then
-    echo "No CSV files found matching pattern '$PATTERN' in the current directory."
+if [ $total_files -eq 0 ]; then
+    echo -e "${RED}No CSV files found matching pattern '$PATTERN'.${NC}" >&2
     exit 1
 fi
 
-# Sort CSV files alphabetically
-csv_files=(${(o)csv_files})
+echo -e "${GREEN}Found ${total_files} CSV file(s).${NC}"
 
-# Store TOC entries
-TOC_ENTRIES=()
+# Sort CSV files alphabetically.
+IFS=$'\n' sorted=($(sort <<<"${csv_files[*]}"))
+csv_files=("${sorted[@]}")
+unset IFS
 
-# Process files (sequentially or in parallel)
-if [[ "$PARALLEL" == true ]]; then
+# TOC entries array.
+declare -a TOC_ENTRIES
+
+# Process CSV files.
+if $PARALLEL; then
+    echo -e "${YELLOW}Processing ${total_files} files in parallel...${NC}" >&2
     export -f process_file check_file decompress_file display_metadata display_headers display_lines handle_delimiter
-    export DELIMITER LINES USE_CSVKIT COLUMNS INCLUDE_TOC METADATA_FIELDS
-    echo "Processing $total_files files in parallel..." >&2
-    printf "%s\n" "${csv_files[@]}" | parallel -j $(sysctl -n hw.ncpu) process_file
+    export DELIMITER LINES USE_CSVKIT COLUMNS INCLUDE_TOC METADATA_FIELDS SHOW_METADATA SHOW_HEADERS SHOW_LINES
+    # Using GNU Parallel's built-in --bar for progress.
+    printf "%s\n" "${csv_files[@]}" | parallel --bar -j "$CPU_COUNT" process_file >> "$TEMP_MD_FILE" 2>/dev/null
 else
     current_file=0
     for file in "${csv_files[@]}"; do
         ((current_file++))
-        echo "Processing file $current_file of $total_files: $file" >&2
-
-        if [[ "$INCLUDE_TOC" == true ]]; then
-            TOC_ENTRIES+=("- [$file](#file-${file//[^a-zA-Z0-9]/-})")
+        percent=$(( 100 * current_file / total_files ))
+        echo -ne "${YELLOW}Processing file $current_file of $total_files ($percent%)...${NC}\r" >&2
+        if $INCLUDE_TOC; then
+            anchor=$(echo "$file" | sed 's/[^a-zA-Z0-9]/-/g')
+            TOC_ENTRIES+=( "- [$file](#file-$anchor)" )
         fi
-
-        process_file "$file"
+        process_file "$file" >> "$TEMP_MD_FILE"
     done
+    echo "" >&2  # Newline after progress.
 fi
 
-echo "Processing complete." >&2
+echo -e "${GREEN}File processing complete.${NC}" >&2
 
-# Insert TOC if requested
-if [[ "$INCLUDE_TOC" == true ]]; then
-    if [[ "$OUTPUT_FORMAT" != "md" ]]; then
-        sed -i '' "/<!-- TOC will be inserted here -->/r /dev/stdin" "$TEMP_MD_FILE" <<< ${(F)TOC_ENTRIES}
-    else
-        # sed -i '' "/<!-- TOC will be inserted here -->/r /dev/stdin" "$OUTPUT_FILE" <<< ${(F)TOC_ENTRIES}
-        echo " ERROR at line 430, --> else --> Function : Insert TOC if requested"
-    fi
+# Insert TOC if requested.
+if $INCLUDE_TOC; then
+    TOC_BLOCK=$(printf "%s\n" "${TOC_ENTRIES[@]}")
+    sed "${SED_INPLACE[@]}" "/<!-- TOC will be inserted here -->/r /dev/stdin" "$TEMP_MD_FILE" <<< "$TOC_BLOCK"
 fi
 
-# Convert to HTML or PDF if requested
-if [[ "$OUTPUT_FORMAT" != "md" ]]; then
+#############################
+# Output Conversion
+#############################
+if [ "$OUTPUT_FORMAT" != "md" ]; then
+    echo -e "${BLUE}Converting Markdown to $OUTPUT_FORMAT...${NC}" >&2
     pandoc_cmd=(pandoc "$TEMP_MD_FILE" -o "$FINAL_OUTPUT_FILE")
-    if [[ "$INCLUDE_TOC" == true ]]; then
+    if $INCLUDE_TOC; then
         pandoc_cmd+=(--toc)
     fi
-    if [[ "$OUTPUT_FORMAT" == "html" && -n "$PANDOC_CSS" ]]; then
+    if [ "$OUTPUT_FORMAT" == "html" ] && [ -n "$PANDOC_CSS" ]; then
         pandoc_cmd+=(-c "$PANDOC_CSS")
     fi
-    if [[ "$OUTPUT_FORMAT" == "pdf" && -n "$PANDOC_TEMPLATE" ]]; then
+    if [ "$OUTPUT_FORMAT" == "pdf" ] && [ -n "$PANDOC_TEMPLATE" ]; then
         pandoc_cmd+=(--template "$PANDOC_TEMPLATE")
     fi
     "${pandoc_cmd[@]}"
-    if [[ $? -eq 0 ]]; then
-        if [[ "$OUTPUT_FORMAT" == "html" ]]; then
-            echo "HTML output written to $FINAL_OUTPUT_FILE" >&2
+    if [ $? -eq 0 ]; then
+        if [ "$OUTPUT_FORMAT" == "html" ]; then
+            echo -e "${GREEN}HTML output written to ${CYAN}$FINAL_OUTPUT_FILE${NC}" >&2
         else
-            echo "PDF output written to $FINAL_OUTPUT_FILE" >&2
+            echo -e "${GREEN}PDF output written to ${CYAN}$FINAL_OUTPUT_FILE${NC}" >&2
         fi
     else
-        echo "Error: Failed to convert Markdown to $OUTPUT_FORMAT using pandoc." >&2
+        echo -e "${RED}Error: pandoc conversion failed.${NC}" >&2
         exit 1
     fi
     rm -f "$TEMP_MD_FILE"
 else
-    echo "Markdown output written to $FINAL_OUTPUT_FILE" >&2
+    mv "$TEMP_MD_FILE" "$FINAL_OUTPUT_FILE"
+    echo -e "${GREEN}Markdown output written to ${CYAN}$FINAL_OUTPUT_FILE${NC}" >&2
 fi
 
-# Compress output file if requested
-if [[ "$COMPRESS_OUTPUT" == true ]]; then
-    if command -v gzip &> /dev/null; then
+if $COMPRESS_OUTPUT; then
+    if command -v gzip &>/dev/null; then
         gzip -f "$FINAL_OUTPUT_FILE"
-        if [[ $? -eq 0 ]]; then
+        if [ $? -eq 0 ]; then
             FINAL_OUTPUT_FILE="$FINAL_OUTPUT_FILE.gz"
-            echo "Compressed output written to $FINAL_OUTPUT_FILE" >&2
+            echo -e "${GREEN}Compressed output written to ${CYAN}$FINAL_OUTPUT_FILE${NC}" >&2
         else
-            echo "Error: Failed to compress output file." >&2
+            echo -e "${RED}Error: Compression failed.${NC}" >&2
             exit 1
         fi
     else
-        echo "Warning: gzip not found. Output file not compressed." >&2
+        echo -e "${YELLOW}Warning:${NC} gzip not found. Output file not compressed." >&2
     fi
 fi
+
+echo -e "${GREEN}Done. Check the file: ${CYAN}$FINAL_OUTPUT_FILE${NC}"
